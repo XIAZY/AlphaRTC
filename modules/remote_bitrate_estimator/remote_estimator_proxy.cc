@@ -8,11 +8,16 @@
  *  be found in the AUTHORS file in the root of the source tree.
  */
 
+#ifdef WIN32
+#pragma comment(lib, "../../modules/third_party/onnxinfer/lib/onnxinfer.lib")
+#endif  //  WIN32
+
 #include "modules/remote_bitrate_estimator/remote_estimator_proxy.h"
 
 #include <algorithm>
 #include <limits>
 
+#include "api/alphacc_config.h"
 #include "modules/rtp_rtcp/source/rtcp_packet/transport_feedback.h"
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
@@ -40,13 +45,27 @@ RemoteEstimatorProxy::RemoteEstimatorProxy(
       media_ssrc_(0),
       feedback_packet_count_(0),
       send_interval_ms_(send_config_.default_interval->ms()),
-      send_periodic_feedback_(true) {
+      send_periodic_feedback_(true),
+      bwe_sendback_interval_ms_(GetAlphaCCConfig()->bwe_feedback_duration_ms),
+      last_bwe_sendback_ms_(clock->TimeInMilliseconds()),
+      stats_collect_(StatCollect::SC_TYPE_STRUCT),
+      cycles_(-1),
+      max_abs_send_time_(0) {
+  onnx_infer_ = onnxinfer::CreateONNXInferInterface(
+      GetAlphaCCConfig()->onnx_model_path.c_str());
+  if (!onnxinfer::IsReady(onnx_infer_)) {
+    RTC_LOG(LS_ERROR) << "Failed to create onnx_infer_.";
+  }
   RTC_LOG(LS_INFO)
       << "Maximum interval between transport feedback RTCP messages (ms): "
       << send_config_.max_interval->ms();
 }
 
-RemoteEstimatorProxy::~RemoteEstimatorProxy() {}
+RemoteEstimatorProxy::~RemoteEstimatorProxy() {
+  if (onnx_infer_) {
+    onnxinfer::DestroyONNXInferInterface(onnx_infer_);
+  }
+}
 
 void RemoteEstimatorProxy::IncomingPacket(int64_t arrival_time_ms,
                                           size_t payload_size,
@@ -61,6 +80,51 @@ void RemoteEstimatorProxy::IncomingPacket(int64_t arrival_time_ms,
   media_ssrc_ = header.ssrc;
   OnPacketArrival(header.extension.transportSequenceNumber, arrival_time_ms,
                   header.extension.feedback_request);
+
+  //--- ONNXInfer: Input the per-packet info to ONNXInfer module ---
+  uint32_t send_time_ms =
+      GetTtimeFromAbsSendtime(header.extension.absoluteSendTime);
+
+  // lossCound and RTT field for onnxinfer::OnReceived() are set to -1 since
+  // no available lossCound and RTT in webrtc
+  onnxinfer::OnReceived(onnx_infer_, header.payloadType, header.sequenceNumber,
+                        send_time_ms, header.ssrc, header.paddingLength,
+                        header.headerLength, arrival_time_ms, payload_size, -1, -1);
+
+  //--- BandWidthControl: Send back bandwidth estimation into to sender ---
+  bool time_to_send_bew_message = TimeToSendBweMessage();
+  float estimation = 0;
+  if (time_to_send_bew_message) {
+    BweMessage bwe;
+    estimation = onnxinfer::GetBweEstimate(onnx_infer_);
+    bwe.pacing_rate = bwe.padding_rate = bwe.target_rate = estimation;
+    bwe.timestamp_ms = clock_->TimeInMilliseconds();
+    SendbackBweEstimation(bwe);
+  }
+
+  // Save per-packet info locally on receiving
+  // ---------- Collect packet-related info into a local file ----------
+  double pacing_rate =
+      time_to_send_bew_message ? estimation : SC_PACER_PACING_RATE_EMPTY;
+  double padding_rate =
+      time_to_send_bew_message ? estimation : SC_PACER_PADDING_RATE_EMPTY;
+
+  // Save per-packet info locally on receiving
+  auto res = stats_collect_.StatsCollect(
+      pacing_rate, padding_rate, header.payloadType,
+                              header.sequenceNumber, send_time_ms, header.ssrc,
+                              header.paddingLength, header.headerLength,
+                              arrival_time_ms, payload_size, 0);
+  if (res != StatCollect::SCResult::SC_SUCCESS)
+  {
+    RTC_LOG(LS_ERROR) << "Collect data failed";
+  }
+  std::string out_data = stats_collect_.DumpData();
+  if (out_data.empty())
+  {
+    RTC_LOG(LS_ERROR) << "Save data failed";
+  }
+  RTC_LOG(LS_INFO) << out_data;
 }
 
 bool RemoteEstimatorProxy::LatestEstimate(std::vector<unsigned int>* ssrcs,
@@ -170,6 +234,15 @@ void RemoteEstimatorProxy::OnPacketArrival(
   }
 }
 
+bool RemoteEstimatorProxy::TimeToSendBweMessage() {
+  int64_t time_now = clock_->TimeInMilliseconds();
+  if (time_now - bwe_sendback_interval_ms_ > last_bwe_sendback_ms_) {
+    last_bwe_sendback_ms_ = time_now;
+    return true;
+  }
+  return false;
+}
+
 void RemoteEstimatorProxy::SendPeriodicFeedbacks() {
   // |periodic_window_start_seq_| is the first sequence number to include in the
   // current feedback packet. Some older may still be in the map, in case a
@@ -220,6 +293,16 @@ void RemoteEstimatorProxy::SendFeedbackOnRequest(
   feedback_sender_->SendTransportFeedback(&feedback_packet);
 }
 
+void RemoteEstimatorProxy::SendbackBweEstimation(const BweMessage& bwe) {
+  rtcp::App app_packet;
+
+  app_packet.SetSubType(kAppPacketSubType);
+  app_packet.SetName(kAppPacketName);
+
+  app_packet.SetData(reinterpret_cast<const uint8_t*>(&bwe), sizeof(bwe));
+  feedback_sender_->SendApplicationPacket(&app_packet);
+}
+
 int64_t RemoteEstimatorProxy::BuildFeedbackPacket(
     uint8_t feedback_packet_count,
     uint32_t media_ssrc,
@@ -253,6 +336,36 @@ int64_t RemoteEstimatorProxy::BuildFeedbackPacket(
     next_sequence_number = it->first + 1;
   }
   return next_sequence_number;
+}
+
+uint32_t RemoteEstimatorProxy::GetTtimeFromAbsSendtime(
+    uint32_t absoluteSendTime) {
+  if (cycles_ == -1) {
+    // Initalize
+    max_abs_send_time_ = absoluteSendTime;
+    cycles_ = 0;
+  }
+  // Abs sender time is 24 bit 6.18 fixed point. Shift by 8 to normalize to
+  // 32 bits (unsigned). Calculate the difference between this packet's
+  // send time and the maximum observed. Cast to signed 32-bit to get the
+  // desired wrap-around behavior.
+  if (static_cast<int32_t>((absoluteSendTime << 8) -
+                           (max_abs_send_time_ << 8)) >= 0) {
+    // The difference is non-negative, meaning that this packet is newer
+    // than the previously observed maximum absolute send time.
+    if (absoluteSendTime < max_abs_send_time_) {
+      // Wrap detected.
+      cycles_++;
+    }
+    max_abs_send_time_ = absoluteSendTime;
+  }
+  // Abs sender time is 24 bit 6.18 fixed point. Divide by 2^18 to convert
+  // to floating point representation.
+  double send_time_seconds =
+      static_cast<double>(absoluteSendTime) / 262144 + 64.0 * cycles_;
+  uint32_t send_time_ms =
+      static_cast<uint32_t>(std::round(send_time_seconds * 1000));
+  return send_time_ms;
 }
 
 }  // namespace webrtc

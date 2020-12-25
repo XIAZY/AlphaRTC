@@ -646,6 +646,12 @@ class RTC_EXPORT PeerConnectionInterface : public rtc::RefCountInterface {
     // passed.
     bool offer_extmap_allow_mixed = false;
 
+    // The path of the onnx model
+    absl::optional<std::string> onnx_model_path;
+
+    // The rate update time in milliseconds
+    int rate_update_ms = kUndefined;
+  
     //
     // Don't forget to update operator== if adding something.
     //
