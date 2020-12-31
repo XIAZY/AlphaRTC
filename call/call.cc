@@ -534,7 +534,10 @@ void Call::SetClientBitratePreferences(const BitrateSettings& preferences) {
 }
 
 uint32_t Call::last_bandwidth_bps() {
-  return last_bandwidth_bps_;
+  {
+    rtc::CritScope cs(&last_bandwidth_bps_crit_);
+    return last_bandwidth_bps_;
+  }
 }
 
 void Call::UpdateHistograms() {
